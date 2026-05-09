@@ -1,0 +1,5 @@
+etat_bot.json
+historique_trades.txt
+__pycache__/
+*.pyc
+.env
