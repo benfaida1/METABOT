@@ -1,398 +1,676 @@
+#!/usr/bin/env python3
+"""
+METABOT — bot de trading spot Binance.
+
+Mode:
+  PAPER_TRADING=true  -> simulation (par defaut, prix reels, argent virtuel)
+  PAPER_TRADING=false -> trading reel (cles API requises)
+
+Toutes les variables sensibles passent par les variables d'environnement.
+Voir les instructions d'installation fournies separement.
+"""
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 import time
 import os
 import hmac
 import hashlib
 import math
+import socket
+import sys
 
-# ==============================================================================
-# 🎚️ L'INTERRUPTEUR PRINCIPAL (LE MODE DU BOT)
-# ==============================================================================
-# True  = Argent Virtuel (Mais graphiques et prix 100% RÉELS en direct)
-# False = Argent Réel (Nécessite tes vraies clés API Binance ci-dessous)
-PAPER_TRADING = True
 
-# ==============================================================================
-# 🔑 TES CLÉS API BINANCE (VRAI COMPTE)
-# ==============================================================================
-API_KEY = "TES_VRAIES_CLES_ICI_QUAND_TU_SERAS_PRET"
-API_SECRET = "TON_VRAI_SECRET_ICI"
+# ---------------------------------------------------------------------
+# Configuration (variables d'environnement)
+# ---------------------------------------------------------------------
+def _env_bool(name, default):
+    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
-# Le bot est maintenant branché directement sur la salle des marchés de Wall Street
-BASE_URL = "https://api.binance.com"
 
-# ==============================================================================
-# 📱 CONFIGURATION TELEGRAM
-# ==============================================================================
-TELEGRAM_TOKEN = "8622927710:AAGl3VA41cOZZ_XyhsLBF48z_9ANJ6iCVY0"
-TELEGRAM_CHAT_ID = "5884257994"
-
-# ==============================================================================
-# ⚙️ CONFIGURATION ET MONEY MANAGEMENT
-# ==============================================================================
-ALLOCATION_PAR_CRYPTO = 0.10
-TAUX_REINVESTISSEMENT = 0.80
-MAX_CANDIDATS_SCAN = 15
-MAX_PALIERS = 4
-STOP_LOSS_GLOBAL = 0.98
-DECLENCHEMENT_TRAILING_STOP = 1.01
-SEUIL_BREAK_EVEN = 1.015
-FICHIER_SAUVEGARDE = "etat_bot.json"
-FICHIER_TRADES = "historique_trades.txt"
-MIN_ORDER_USDT = 11.0
-CAPITAL_INITIAL = 500.0
-
-def envoyer_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+def _env_float(name, default):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = urllib.parse.urlencode({'chat_id': TELEGRAM_CHAT_ID, 'text': message}).encode('utf-8')
-        urllib.request.urlopen(url, data=data)
-    except: pass
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
 
-def log_trade(message):
-    print(f"\n{message}\n")
+
+PAPER_TRADING    = _env_bool("PAPER_TRADING", True)
+API_KEY          = os.environ.get("BINANCE_API_KEY", "")
+API_SECRET       = os.environ.get("BINANCE_API_SECRET", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+CAPITAL_INITIAL  = _env_float("CAPITAL_INITIAL", 500.0)
+
+BASE_URL     = "https://api.binance.com"
+RECV_WINDOW  = 5000
+HTTP_TIMEOUT = 10
+
+# Sizing
+ALLOC_PAR_TRADE       = 0.10
+MAX_POSITIONS         = 4
+MIN_ORDER_USDT        = 11.0
+TAUX_REINVESTISSEMENT = 0.80
+
+# Frais et slippage (modele paper)
+FEE_RATE            = 0.00075   # 0.075% avec discount BNB
+SLIPPAGE_RATE_PAPER = 0.0005    # 5 bps simules sur ordre marche
+
+# Risque ATR-based (R:R cible ~1:2)
+ATR_SL_MULT       = 1.5
+ATR_TP_MULT       = 3.0
+ATR_TRAIL_MULT    = 2.0
+SL_FLOOR_PCT      = 0.015      # SL min 1.5%
+BREAK_EVEN_BUFFER = 0.003      # +30 bps au-dessus du PRU
+MAX_HOLD_SECONDS  = 4 * 3600
+
+# Garde-fous
+DAILY_LOSS_LIMIT_PCT    = 3.0
+COOLDOWN_AFTER_LOSS_SEC = 30 * 60
+
+# Scanner (philosophie: pullback dans tendance, pas chasse au pump)
+MAX_CANDIDATS_SCAN = 12
+MIN_VOLUME_24H_USD = 20_000_000
+MAX_24H_PUMP_PCT   = 8.0       # n'achete pas un coin deja +8% sur 24h
+MIN_ATR_PCT        = 0.15      # filtre coins morts
+MAX_DIST_EMA20_1H  = 0.04      # prix doit etre a <4% au-dessus de la EMA20 1h
+
+# Fichiers
+FICHIER_SAUVEGARDE = "etat_bot.json"
+FICHIER_TRADES     = "historique_trades.txt"
+FICHIER_ERREURS    = "erreurs.log"
+
+
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+def _now():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log_info(msg):
+    print(f"[{_now()}] {msg}")
+
+
+def log_trade(msg):
+    line = f"[{_now()}] {msg}"
+    print(line)
     try:
         with open(FICHIER_TRADES, "a", encoding="utf-8") as f:
-            f.write(message + "\n")
-    except: pass
-    envoyer_telegram(message)
+            f.write(line + "\n")
+    except OSError:
+        pass
+    envoyer_telegram(line)
 
-def obtenir_prix_actuels():
+
+def log_error(msg):
+    line = f"[{_now()}] ERROR: {msg}"
+    print(line, file=sys.stderr)
     try:
+        with open(FICHIER_ERREURS, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------
+def envoyer_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+        }).encode("utf-8")
+        urllib.request.urlopen(url, data=data, timeout=5)
+    except (urllib.error.URLError, socket.timeout) as e:
+        log_error(f"Telegram: {e}")
+
+
+# ---------------------------------------------------------------------
+# Binance API helpers
+# ---------------------------------------------------------------------
+def _http_get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "metabot/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:300]
+        log_error(f"HTTP {e.code} {url}: {body}")
+    except (urllib.error.URLError, socket.timeout, json.JSONDecodeError) as e:
+        log_error(f"GET {url}: {e}")
+    return None
+
+
+def signed_request(method, endpoint, params):
+    if not API_KEY or not API_SECRET:
+        log_error("Cles API manquantes pour requete signee")
+        return None
+    params = dict(params)
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = RECV_WINDOW
+    qs = urllib.parse.urlencode(params)
+    sig = hmac.new(API_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    qs += f"&signature={sig}"
+    url = f"{BASE_URL}{endpoint}"
+    if method == "GET":
+        req = urllib.request.Request(url + "?" + qs, method="GET")
+    else:
+        req = urllib.request.Request(url, data=qs.encode(), method=method)
+    req.add_header("X-MBX-APIKEY", API_KEY)
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:300]
+        log_error(f"{method} {endpoint}: HTTP {e.code} {body}")
+    except (urllib.error.URLError, socket.timeout, json.JSONDecodeError) as e:
+        log_error(f"{method} {endpoint}: {e}")
+    return None
+
+
+def obtenir_prix_actuels(symboles=None):
+    if symboles:
+        sym_list = list(symboles)
+        if not sym_list:
+            return {}
+        sym_param = json.dumps(sym_list, separators=(",", ":"))
+        url = f"{BASE_URL}/api/v3/ticker/price?symbols={urllib.parse.quote(sym_param)}"
+    else:
         url = f"{BASE_URL}/api/v3/ticker/price"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as r:
-            data = json.loads(r.read().decode())
-            return {item['symbol']: float(item['price']) for item in data}
-    except: return {}
+    data = _http_get_json(url)
+    if not data:
+        return {}
+    if isinstance(data, dict):
+        return {data["symbol"]: float(data["price"])}
+    return {item["symbol"]: float(item["price"]) for item in data}
+
+
+def obtenir_klines(symbole, intervalle, limite):
+    url = f"{BASE_URL}/api/v3/klines?symbol={symbole}&interval={intervalle}&limit={limite}"
+    data = _http_get_json(url)
+    if not data:
+        return None
+    return [
+        {"o": float(b[1]), "h": float(b[2]), "l": float(b[3]),
+         "c": float(b[4]), "v": float(b[5])}
+        for b in data
+    ]
+
+
+_exchange_info_cache = {"data": None, "ts": 0}
+
+
+def obtenir_filtres_symbole(symbole):
+    now = time.time()
+    if not _exchange_info_cache["data"] or (now - _exchange_info_cache["ts"]) > 3600:
+        info = _http_get_json(f"{BASE_URL}/api/v3/exchangeInfo")
+        if info and "symbols" in info:
+            _exchange_info_cache["data"] = {s["symbol"]: s for s in info["symbols"]}
+            _exchange_info_cache["ts"] = now
+    cache = _exchange_info_cache["data"]
+    return cache.get(symbole) if cache else None
+
 
 def arrondir_lot_size(symbole, quantite):
-    try:
-        url = f"{BASE_URL}/api/v3/exchangeInfo?symbol={symbole}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as r:
-            info = json.loads(r.read().decode())
-            for filtre in info['symbols'][0]['filters']:
-                if filtre['filterType'] == 'LOT_SIZE':
-                    step_size = float(filtre['stepSize'])
-                    quantite_nette = math.floor(quantite / step_size) * step_size
-                    if step_size.is_integer(): return f"{int(quantite_nette)}"
-                    else:
-                        str_step = f"{step_size:f}".rstrip('0')
-                        decimals = len(str_step.split('.')[1]) if '.' in str_step else 0
-                        return f"{quantite_nette:.{decimals}f}"
-    except: pass
-    return f"{int(quantite)}"
+    info = obtenir_filtres_symbole(symbole)
+    if not info:
+        return f"{quantite:.6f}"
+    for f in info.get("filters", []):
+        if f["filterType"] == "LOT_SIZE":
+            step = float(f["stepSize"])
+            qte = math.floor(quantite / step) * step
+            if step >= 1:
+                return f"{int(qte)}"
+            decimals = max(0, -int(math.floor(math.log10(step))))
+            return f"{qte:.{decimals}f}"
+    return f"{quantite:.6f}"
 
-def passer_ordre(symbole, side, quantite=None, montant_usdt=None):
-    # 🛑 BLOCAGE PAPER TRADING 🛑
-    if PAPER_TRADING:
-        # En mode Paper Trading, on simule que l'ordre Binance est passé avec succès
-        return True
 
-    # 🟢 VRAI TRADING (Mode Live) 🟢
-    endpoint = "/api/v3/order"
-    timestamp = int(time.time() * 1000)
-    params = {"symbol": symbole, "side": side, "type": "MARKET", "timestamp": timestamp}
-    if side == "BUY" and montant_usdt: params["quoteOrderQty"] = f"{montant_usdt:.2f}"
-    elif side == "SELL" and quantite: params["quantity"] = arrondir_lot_size(symbole, quantite)
+# ---------------------------------------------------------------------
+# Indicateurs
+# ---------------------------------------------------------------------
+def ema(values, period):
+    if not values or len(values) < period:
+        return None
+    k = 2.0 / (period + 1)
+    e = sum(values[:period]) / period
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+    return e
 
-    query_string = urllib.parse.urlencode(params)
-    signature = hmac.new(API_SECRET.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
-    query_string += f"&signature={signature}"
-    url = f"{BASE_URL}{endpoint}"
-    requete = urllib.request.Request(url, data=query_string.encode('utf-8'), method="POST")
-    requete.add_header('X-MBX-APIKEY', API_KEY)
 
-    try:
-        with urllib.request.urlopen(requete) as reponse: return True
-    except Exception as e:
-        print(f"❌ Erreur API Binance : {e}")
-        return False
+def rsi_series(values, period=14):
+    if len(values) < period + 1:
+        return []
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        diff = values[i] - values[i-1]
+        gains.append(max(0.0, diff))
+        losses.append(max(0.0, -diff))
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    out = []
+    for i in range(period, len(gains)):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
+        rs = ag / al if al > 0 else float("inf")
+        out.append(100 - 100 / (1 + rs))
+    return out
+
+
+def atr_pct(klines, period=14):
+    if len(klines) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(klines)):
+        h, l, pc = klines[i]["h"], klines[i]["l"], klines[i-1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < period:
+        return None
+    a = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        a = (a * (period - 1) + tr) / period
+    return (a / klines[-1]["c"]) * 100
+
+
+# ---------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------
+def obtenir_top_opportunites():
+    data = _http_get_json(f"{BASE_URL}/api/v3/ticker/24hr")
+    if not data:
+        return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    candidats = []
+    for item in data:
+        sym = item.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        if (sym.endswith("UPUSDT") or sym.endswith("DOWNUSDT")
+                or sym.endswith("BULLUSDT") or sym.endswith("BEARUSDT")):
+            continue
+        try:
+            vol = float(item["quoteVolume"])
+            pct = float(item["priceChangePercent"])
+        except (ValueError, KeyError):
+            continue
+        if vol < MIN_VOLUME_24H_USD:
+            continue
+        # On evite les coins deja en pump fort sur 24h (achat de tops)
+        if pct > MAX_24H_PUMP_PCT:
+            continue
+        candidats.append((sym, vol))
+    candidats.sort(key=lambda x: x[1], reverse=True)
+    return [c[0] for c in candidats[:MAX_CANDIDATS_SCAN]]
+
+
+# ---------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------
+def etat_par_defaut():
+    return {
+        "solde_usdt": CAPITAL_INITIAL,
+        "positions": {},
+        "plus_haut_capital": CAPITAL_INITIAL,
+        "capital_coffre": 0.0,
+        "cooldowns": {},
+        "jour_courant": "",
+        "equity_debut_jour": CAPITAL_INITIAL,
+        "trading_bloque_jour": False,
+    }
+
 
 def charger_etat():
-    if os.path.exists(FICHIER_SAUVEGARDE):
-        try:
-            with open(FICHIER_SAUVEGARDE, 'r') as f:
-                d = json.load(f)
-                return (
-                    d.get('solde_usdt', CAPITAL_INITIAL),
-                    d.get('positions', {}),
-                    d.get('plus_haut_capital', CAPITAL_INITIAL),
-                    d.get('capital_coffre', 0.0)
-                )
-        except: pass
-    return CAPITAL_INITIAL, {}, CAPITAL_INITIAL, 0.0
-
-def sauvegarder_etat(solde, pos, highest_cap, coffre):
+    if not os.path.exists(FICHIER_SAUVEGARDE):
+        return etat_par_defaut()
     try:
-        with open(FICHIER_SAUVEGARDE, 'w') as f:
-            json.dump({
-                'solde_usdt': solde,
-                'positions': pos,
-                'plus_haut_capital': highest_cap,
-                'capital_coffre': coffre
-            }, f, indent=4)
-    except: pass
+        with open(FICHIER_SAUVEGARDE, "r") as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log_error(f"charger_etat: {e}")
+        return etat_par_defaut()
+    base = etat_par_defaut()
+    base.update(d)
+    return base
 
-def obtenir_klines_completes(symbole, intervalle="1m", limite=60):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbole}&interval={intervalle}&limit={limite}"
+
+def sauvegarder_etat(etat):
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as r:
-            data = json.loads(r.read().decode())
-            return [{'h': float(b[2]), 'l': float(b[3]), 'c': float(b[4]), 'v': float(b[7])} for b in data]
-    except: return None
+        tmp = FICHIER_SAUVEGARDE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(etat, f, indent=2)
+        os.replace(tmp, FICHIER_SAUVEGARDE)
+    except OSError as e:
+        log_error(f"sauvegarder_etat: {e}")
 
-def evaluer_tendance(prix):
-    if not prix or len(prix) < 25: return False
-    return (sum(prix[-7:]) / 7) > (sum(prix[-25:]) / 25)
 
-def calculer_rsi(prix, p=14):
-    if not prix or len(prix) < p + 1: return 50
-    gains = [max(0, prix[i] - prix[i-1]) for i in range(1, len(prix))]
-    pertes = [max(0, prix[i-1] - prix[i]) for i in range(1, len(prix))]
-    ag, al = sum(gains[:p]) / p, sum(pertes[:p]) / p
-    for i in range(p, len(gains)):
-        ag, al = (ag * (p - 1) + gains[i]) / p, (al * (p - 1) + pertes[i]) / p
-    return 100 - (100 / (1 + (ag / al))) if al != 0 else 100
+# ---------------------------------------------------------------------
+# Passage d'ordres avec reconciliation
+# ---------------------------------------------------------------------
+def passer_ordre(symbole, side, quantite=None, montant_usdt=None, ref_price=None):
+    """
+    Retourne {filled_qty, avg_price, quote_amount} ou None.
+    quote_amount = USDT depenses (BUY) ou recus apres frais (SELL).
+    """
+    if PAPER_TRADING:
+        if not ref_price or ref_price <= 0:
+            log_error("paper_trade: ref_price manquant")
+            return None
+        if side == "BUY":
+            if not montant_usdt or montant_usdt <= 0:
+                return None
+            eff = ref_price * (1 + SLIPPAGE_RATE_PAPER)
+            gross_qty = montant_usdt / eff
+            net_qty = gross_qty * (1 - FEE_RATE)
+            return {"filled_qty": net_qty, "avg_price": eff, "quote_amount": montant_usdt}
+        # SELL
+        if not quantite or quantite <= 0:
+            return None
+        eff = ref_price * (1 - SLIPPAGE_RATE_PAPER)
+        net_quote = quantite * eff * (1 - FEE_RATE)
+        return {"filled_qty": quantite, "avg_price": eff, "quote_amount": net_quote}
 
-def analyser_volatilite_atr(klines, period=14):
-    if not klines or len(klines) < period + 15: return 1.0, False
-    trs = [max(klines[i]['h'] - klines[i]['l'], abs(klines[i]['h'] - klines[i-1]['c']), abs(klines[i]['l'] - klines[i-1]['c'])) for i in range(1, len(klines))]
-    atrs = []
-    for i in range(period, len(trs) + 1): atrs.append(sum(trs[i-period:i]) / period)
-    current_atr_pct = (atrs[-1] / klines[-1]['c']) * 100
-    recent_atrs = atrs[-15:]
-    max_a, min_a = max(recent_atrs), min(recent_atrs)
-    variation_atr = (max_a - min_a) / min_a if min_a > 0 else 0
-    est_en_range_atr = (variation_atr < 0.15) and (current_atr_pct < 0.10)
-    return current_atr_pct, est_en_range_atr
-
-def obtenir_top_opportunites():
+    # LIVE
+    params = {"symbol": symbole, "side": side, "type": "MARKET"}
+    if side == "BUY":
+        params["quoteOrderQty"] = f"{montant_usdt:.2f}"
+    else:
+        params["quantity"] = arrondir_lot_size(symbole, quantite)
+    res = signed_request("POST", "/api/v3/order", params)
+    if not res or res.get("status") != "FILLED":
+        log_error(f"Ordre non rempli: {res}")
+        return None
     try:
-        url = f"{BASE_URL}/api/v3/ticker/24hr"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as r:
-            data = json.loads(r.read().decode())
-
-        candidats_base = []
-        for item in data:
-            sym = item['symbol']
-            if sym.endswith('USDT') and "UPUSDT" not in sym and "DOWNUSDT" not in sym:
-                vol, pct = float(item['quoteVolume']), float(item['priceChangePercent'])
-                # FILTRE RÉEL BINANCE : 15 Millions de $ de liquidité minimum !
-                if vol > 15000000 and pct > 0:
-                    candidats_base.append({'symbol': sym, 'volume': vol, 'pct': pct})
-
-        candidats_base.sort(key=lambda x: x['volume'], reverse=True)
-        top_candidats = candidats_base[:40]
-
-        if not top_candidats:
-            return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-
-        candidats_rvol = []
-        for c in top_candidats:
-            kl = obtenir_klines_completes(c['symbol'], "1d", limite=15)
-            if kl and len(kl) > 5:
-                vols_passes = [k['v'] for k in kl[:-1]]
-                vol_moy = sum(vols_passes) / len(vols_passes) if vols_passes else 1
-                rvol = c['volume'] / vol_moy
-                # Filtre d'explosion : RVOL > 1.2x (20% plus de volume que la normale)
-                if rvol >= 1.2:
-                    c['rvol'] = rvol
-                    candidats_rvol.append(c)
-
-        candidats_rvol.sort(key=lambda x: x.get('rvol', 0), reverse=True)
-        return [c['symbol'] for c in candidats_rvol[:MAX_CANDIDATS_SCAN]]
-    except: return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-
-# ==============================================================================
-# 🚀 BOUCLE PRINCIPALE HYBRIDE
-# ==============================================================================
-solde_usdt, positions, plus_haut_capital, capital_coffre = charger_etat()
-derniere_analyse_radar = 0
-compteur_rapport_horaire = 0
-
-print("\n" + "="*80)
-if PAPER_TRADING:
-    print("🟢 MODE PAPER TRADING ACTIVÉ : Données 100% Réelles, Argent Virtuel.")
-    print("   (Les frais de 0.1% de Binance seront simulés pour être réaliste).")
-else:
-    print("🔴 DANGER : MODE LIVE ACTIVÉ. LE BOT TRADE AVEC VOTRE VRAI ARGENT !")
-print("="*80 + "\n")
-
-while True:
-    heure_actuelle = time.time()
-    heure_str = time.strftime('%H:%M:%S')
-
-    # 🛡️ MOTEUR 1 : LE BOUCLIER HAUTE FRÉQUENCE (3s)
-    if positions:
-        prix_directs = obtenir_prix_actuels()
-        for symbole, t in list(positions.items()):
-            if symbole not in prix_directs: continue
-            px_actuel = prix_directs[symbole]
-
-            if px_actuel > t['prix_max']: t['prix_max'] = px_actuel
-
-            if not t.get('break_even', False) and px_actuel >= t['prix_moyen'] * SEUIL_BREAK_EVEN:
-                t['break_even'] = True
-                log_trade(f"  >>> 🛡️ [{heure_str}] BREAK-EVEN ACTIVÉ | {symbole} (+1.50%) | Risque Zéro !")
-
-            sl_px = t['prix_moyen'] * 1.0025 if t.get('break_even') else t['prix_moyen'] * STOP_LOSS_GLOBAL
-            m_trail = t.get('marge_trailing', 0.015)
-
-            if px_actuel <= sl_px or (t['prix_max'] > t['prix_moyen'] * DECLENCHEMENT_TRAILING_STOP and px_actuel <= t['prix_max'] * (1.0 - m_trail)):
-                if passer_ordre(symbole, "SELL", quantite=t['quantite_totale']):
-                    valeur_revente = t['quantite_totale'] * px_actuel
-
-                    # Simulation réaliste des frais Binance (0.1%)
-                    if PAPER_TRADING: valeur_revente *= 0.999
-
-                    solde_usdt += valeur_revente
-                    prof = ((valeur_revente - t['montant_investi']) / t['montant_investi']) * 100
-
-                    raison = "Frais remboursés" if t.get('break_even', False) and prof <= 0.5 else "Gain" if prof > 0 else "Stop-Loss / Sécurité Crash"
-
-                    del positions[symbole]
-
-                    capital_exact = solde_usdt + sum(pos['montant_investi'] for pos in positions.values())
-                    dashboard_texte = f"🏦 Capital Réel: {capital_exact:.2f}$"
-
-                    log_trade(f"  >>> 🔴 [{heure_str}] VENTE URGENCE ({raison}) | {symbole} | Final: {prof:+.2f}%\n{dashboard_texte}")
-                    sauvegarder_etat(solde_usdt, positions, plus_haut_capital, capital_coffre)
-
-    # 🔎 MOTEUR 2 : LE RADAR STRATÉGIQUE (60s)
-    if heure_actuelle - derniere_analyse_radar >= 60:
-        derniere_analyse_radar = heure_actuelle
-        compteur_rapport_horaire += 1
-
-        candidats_du_jour = obtenir_top_opportunites()
-        symboles_a_scanner = sorted(list(set(list(positions.keys()) + candidats_du_jour)), key=lambda s: (0 if s in positions else 1, s))
-
-        cap_reel = solde_usdt + sum(t['montant_investi'] for t in positions.values())
-
-        if cap_reel > plus_haut_capital:
-            nouveau_profit = cap_reel - plus_haut_capital
-            ajout_coffre = nouveau_profit * (1 - TAUX_REINVESTISSEMENT)
-            capital_coffre += ajout_coffre
-            plus_haut_capital = cap_reel
-
-        cap_travail = cap_reel - capital_coffre
-
-        prix_actuels = obtenir_prix_actuels()
-        val_latente = sum(t['quantite_totale'] * prix_actuels.get(s, t['prix_moyen']) for s, t in positions.items())
-        cap_latent = solde_usdt + val_latente
-        profit_latent_usd = cap_latent - cap_reel
-
-        dashboard_texte = (
-            f"📊 PORTFEUILLE ({'PAPER TRADING' if PAPER_TRADING else 'LIVE'}) | {heure_str}\n"
-            f"🏦 Capital Réel: {cap_reel:.2f}$\n"
-            f"📈 Latent: {cap_latent:.2f}$ ({profit_latent_usd:+.2f}$)\n"
-            f"💵 Libre: {solde_usdt:.2f}$ | 🔒 Coffre: {capital_coffre:.2f}$"
+        executed_qty = float(res["executedQty"])
+        cum_quote = float(res["cummulativeQuoteQty"])
+    except (KeyError, ValueError) as e:
+        log_error(f"Parse reponse ordre: {e} | {res}")
+        return None
+    if executed_qty <= 0:
+        return None
+    avg = cum_quote / executed_qty
+    # Si frais payes en base asset (pas en BNB), deduire de la quantite
+    base_asset = symbole.replace("USDT", "")
+    if side == "BUY":
+        commission_base = sum(
+            float(f.get("commission", 0))
+            for f in res.get("fills", [])
+            if f.get("commissionAsset") == base_asset
         )
+        executed_qty -= commission_base
+    return {"filled_qty": executed_qty, "avg_price": avg, "quote_amount": cum_quote}
 
-        print(f"\n" + "="*120)
-        print(f"🕒 [{heure_str}] RADAR BINANCE RÉEL | {'PAPER TRADING 🟢' if PAPER_TRADING else 'LIVE TRADING 🔴'} | ⚡ RVOL > 1.2x | Vol > 15M$")
-        print(f"🏦 Capital Réel: {cap_reel:.2f}$ | 📈 Latent: {cap_latent:.2f}$ ({profit_latent_usd:+.2f}$)")
-        print(f"💵 Libre: {solde_usdt:.2f}$ | 🔒 Coffre (20%): {capital_coffre:.2f}$")
-        print("="*120)
 
-        if compteur_rapport_horaire >= 60:
-            envoyer_telegram(f"⏱️ BILAN HORAIRE :\n{dashboard_texte}")
-            compteur_rapport_horaire = 0
+# ---------------------------------------------------------------------
+# Strategie: pullback dans tendance haussiere
+# ---------------------------------------------------------------------
+def detecter_signal(kl1m, kl1h, kl1d):
+    """Retourne {atr_pct, prix} si signal d'achat valide, sinon None."""
+    if not kl1m or not kl1h or not kl1d:
+        return None
+    if len(kl1m) < 30 or len(kl1h) < 60 or len(kl1d) < 25:
+        return None
 
-        for symbole in symboles_a_scanner:
-            kl1m, kl5m, kl1h, kl1d = obtenir_klines_completes(symbole, "1m", limite=60), obtenir_klines_completes(symbole, "5m", limite=30), obtenir_klines_completes(symbole, "1h", limite=48), obtenir_klines_completes(symbole, "1d", limite=30)
-            if not kl1m or not kl5m or not kl1h or not kl1d: continue
+    closes_1d = [k["c"] for k in kl1d]
+    closes_1h = [k["c"] for k in kl1h]
+    closes_1m = [k["c"] for k in kl1m]
+    px = closes_1m[-1]
 
-            px_actuel, px1m = kl1m[-1]['c'], [k['c'] for k in kl1m]
-            tend1d, tend1h, tend5m = evaluer_tendance([k['c'] for k in kl1d]), evaluer_tendance([k['c'] for k in kl1h]), evaluer_tendance([k['c'] for k in kl1m])
-            s7_1m, s25_1m = sum(px1m[-7:])/7, sum(px1m[-25:])/25
-            s7_p, s25_p = sum(px1m[-8:-1])/7, sum(px1m[-26:-1])/25
-            rsi_1m = calculer_rsi(px1m)
+    # Filtre 1: tendance journaliere haussiere (prix > EMA20 1d en hausse)
+    ema20_1d = ema(closes_1d, 20)
+    ema20_1d_prev = ema(closes_1d[:-1], 20)
+    if not ema20_1d or not ema20_1d_prev:
+        return None
+    if not (closes_1d[-1] > ema20_1d and ema20_1d > ema20_1d_prev):
+        return None
 
-            atr_pct, atr_est_plat = analyser_volatilite_atr(kl1m)
+    # Filtre 2: tendance horaire haussiere (prix > EMA50 1h)
+    ema50_1h = ema(closes_1h, 50)
+    ema20_1h = ema(closes_1h, 20)
+    if not ema50_1h or not ema20_1h:
+        return None
+    if closes_1h[-1] <= ema50_1h:
+        return None
 
-            vols_passes_1d = [k['v'] for k in kl1d[:-1]]
-            vol_moy_1d = sum(vols_passes_1d) / len(vols_passes_1d) if vols_passes_1d else 1
-            vol_24h_actuel = sum([k['v'] for k in kl1h[-24:]]) if len(kl1h) >= 24 else kl1d[-1]['v']
-            rvol_affichage = vol_24h_actuel / vol_moy_1d if vol_moy_1d > 0 else 1.0
+    # Filtre 3: pas trop etendu au-dessus de la EMA20 1h (eviter d'acheter le top)
+    if (px - ema20_1h) / ema20_1h > MAX_DIST_EMA20_1H:
+        return None
 
-            if not tend1d: mode_marche = "CRASH"
-            elif atr_est_plat or (tend1d and not tend1h): mode_marche = "RANGE"
-            else: mode_marche = "TENDANCE"
+    # Filtre 4: ATR exploitable
+    a = atr_pct(kl1m, 14)
+    if a is None or a < MIN_ATR_PCT:
+        return None
 
-            alloc_pct, force_signal = 0.05, "Prudent (5%)"
-            if 40 <= rsi_1m <= 55 and mode_marche == "TENDANCE":
-                alloc_pct, force_signal = 0.10, "Standard (10%)"
-            if alloc_pct == 0.10 and ((s7_1m - s25_1m) / s25_1m) * 100 > 0.08:
-                alloc_pct, force_signal = 0.15, "Or (15%)"
+    # Setup pullback: RSI 1m est descendu < 35 dans les 15 dernieres bougies
+    rsis = rsi_series(closes_1m, 14)
+    if len(rsis) < 16:
+        return None
+    if min(rsis[-15:]) >= 35:
+        return None
 
-            budget_dyn = cap_travail * alloc_pct
-            palier_dyn = max(MIN_ORDER_USDT, budget_dyn / MAX_PALIERS)
+    # Trigger: RSI courant remonte au-dessus de 45 + bougie verte de confirmation
+    if not (rsis[-1] > 45 and rsis[-1] > rsis[-2]):
+        return None
+    if closes_1m[-1] <= closes_1m[-2]:
+        return None
 
-            if symbole in positions:
-                t = positions[symbole]
-                t['marge_trailing'] = max(1.0, atr_pct * 1.5) / 100.0
+    return {"atr_pct": a, "prix": px}
 
-                # Le profit tient compte virtuellement de ce qu'il resterait après les frais de revente
-                valeur_actuelle_nette = t['quantite_totale'] * px_actuel * (0.999 if PAPER_TRADING else 1.0)
-                prof = ((valeur_actuelle_nette - t['montant_investi']) / t['montant_investi']) * 100
 
-                sl_px = t['prix_moyen'] * 1.0025 if t.get('break_even') else t['prix_moyen'] * STOP_LOSS_GLOBAL
-                etat_risque = "🛡️ BE Actif" if t.get('break_even') else f"SL: {sl_px:.4f}$"
+# ---------------------------------------------------------------------
+# Reset quotidien et limite de perte
+# ---------------------------------------------------------------------
+def maj_jour(etat, equity_courante):
+    aujourd = time.strftime("%Y-%m-%d", time.gmtime())
+    if etat["jour_courant"] != aujourd:
+        etat["jour_courant"] = aujourd
+        etat["equity_debut_jour"] = equity_courante
+        etat["trading_bloque_jour"] = False
+        return
+    if etat["trading_bloque_jour"]:
+        return
+    baseline = etat["equity_debut_jour"]
+    if baseline > 0:
+        dd = (baseline - equity_courante) / baseline * 100
+        if dd >= DAILY_LOSS_LIMIT_PCT:
+            etat["trading_bloque_jour"] = True
+            log_trade(f"LIMITE PERTE QUOTIDIENNE ATTEINTE ({dd:.2f}%) - pas de nouveaux trades aujourd'hui")
 
-                print(f"🟢 [ACHETÉ] {symbole:<8} | Pos: {t['paliers']}/{MAX_PALIERS} | Inv: {t['montant_investi']:6.2f}$ | PRU: {t['prix_moyen']:8.4f}$ | Actuel: {px_actuel:8.4f}$ | Profit: {prof:>+6.2f}% | {etat_risque}")
 
-                m_dca = max(2.0, atr_pct * 3) / 100.0
-                if t['paliers'] < MAX_PALIERS and px_actuel <= t['dernier_prix_achat'] * (1.0 - m_dca) and solde_usdt >= t['taille_palier_fixee']:
-                    if passer_ordre(symbole, "BUY", montant_usdt=t['taille_palier_fixee']):
-                        solde_usdt -= t['taille_palier_fixee']
+# ---------------------------------------------------------------------
+# Boucle principale
+# ---------------------------------------------------------------------
+def main():
+    if not PAPER_TRADING and (not API_KEY or not API_SECRET):
+        log_error("Mode LIVE mais BINANCE_API_KEY / BINANCE_API_SECRET manquants. Arret.")
+        sys.exit(1)
 
-                        quantite_achetee = t['taille_palier_fixee'] / px_actuel
-                        if PAPER_TRADING: quantite_achetee *= 0.999 # Simule les frais d'achat
+    etat = charger_etat()
+    derniere_analyse = 0
+    derniere_telegram = 0
 
-                        t['quantite_totale'] += quantite_achetee
-                        t['montant_investi'] += t['taille_palier_fixee']
-                        t['dernier_prix_achat'], t['prix_moyen'] = px_actuel, t['montant_investi'] / t['quantite_totale']
-                        t['paliers'] += 1
-                        log_trade(f"  >>> 🟢 [{heure_str}] DCA | {symbole} | Palier {t['paliers']}")
-            else:
-                feu_1d, feu_1h, feu_5m, feu_1m = "🟢" if tend1d else "🔴", "🟢" if tend1h else "🔴", "🟢" if tend5m else "🔴", "🟢" if s7_1m > s25_1m else "🔴"
-                croisement = (s7_p <= s25_p and s7_1m > s25_1m)
-                flash_entry = (force_signal == "Or (15%)" and s7_1m > s25_1m and rsi_1m < 60)
+    print("=" * 80)
+    if PAPER_TRADING:
+        print("MODE PAPER TRADING (argent virtuel, donnees reelles)")
+    else:
+        print("MODE LIVE - TRADING AVEC ARGENT REEL")
+    print(f"Capital initial: {CAPITAL_INITIAL:.2f} USDT")
+    print(f"Solde charge: {etat['solde_usdt']:.2f} USDT | "
+          f"Positions: {len(etat['positions'])} | "
+          f"Coffre: {etat['capital_coffre']:.2f} USDT")
+    print("=" * 80)
 
-                signal_trend = (mode_marche == "TENDANCE" and tend5m and rsi_1m < 65 and (croisement or flash_entry))
-                signal_range = (mode_marche == "RANGE" and rsi_1m < 35 and s7_1m > s25_1m)
+    while True:
+        try:
+            now = time.time()
+            heure_str = time.strftime("%H:%M:%S")
 
-                if mode_marche == "CRASH": statut = "Bloqué (Macro 🔴)"
-                elif mode_marche == "RANGE" and not signal_range: statut = "Range (Attente Support)"
-                elif mode_marche == "TENDANCE" and not signal_trend: statut = "Attente (Pullback Trend)"
-                else: statut = f"🔥 Gâchette armée ({'Rebond Range' if signal_range else force_signal})"
+            # ---------- Bouclier haute frequence (3s) ----------
+            if etat["positions"]:
+                prix = obtenir_prix_actuels(list(etat["positions"].keys()))
+                for sym in list(etat["positions"].keys()):
+                    pos = etat["positions"][sym]
+                    px = prix.get(sym)
+                    if not px:
+                        continue
+                    if px > pos["prix_max"]:
+                        pos["prix_max"] = px
 
-                etat_atr = "(Plat/Squeeze)" if atr_est_plat else ""
-                print(f"🔎 [RADAR]  {symbole:<8} | MTF: 1D:{feu_1d} 1H:{feu_1h} 5m:{feu_5m} | RVOL: {rvol_affichage:4.1f}x | ATR: {atr_pct:.2f}% {etat_atr:<10} | Mode: {mode_marche:<8} | {statut}")
+                    entry = pos["prix_moyen"]
+                    sl_pct = pos["sl_pct"]
+                    trail_pct = pos["trail_pct"]
+                    sl_px = entry * (1 - sl_pct)
 
-                if signal_trend or signal_range:
-                    type_signal = force_signal if signal_trend else "Support Range (10%)"
-                    alloc_utilisee = alloc_pct if signal_trend else 0.10
-                    budget_final = cap_travail * alloc_utilisee
-                    palier_final = max(MIN_ORDER_USDT, budget_final / MAX_PALIERS)
+                    # Break-even active a +1R
+                    if not pos.get("break_even") and px >= entry * (1 + sl_pct):
+                        pos["break_even"] = True
+                        log_trade(f"BREAK-EVEN {sym} (+{sl_pct*100:.2f}%)")
+                    if pos.get("break_even"):
+                        sl_px = max(sl_px, entry * (1 + BREAK_EVEN_BUFFER))
 
-                    if solde_usdt >= palier_final:
-                        if passer_ordre(symbole, "BUY", montant_usdt=palier_final):
-                            solde_usdt -= palier_final
+                    # Trailing stop active a +2R
+                    if pos["prix_max"] >= entry * (1 + sl_pct * 2):
+                        sl_px = max(sl_px, pos["prix_max"] * (1 - trail_pct))
 
-                            quantite_achetee = palier_final / px_actuel
-                            if PAPER_TRADING: quantite_achetee *= 0.999 # Simule les frais d'achat (0.1%)
+                    # Time stop
+                    duree = now - pos["ts_entree"]
+                    time_out = duree >= MAX_HOLD_SECONDS
+                    # Hard TP
+                    hard_tp = px >= entry * (1 + sl_pct * (ATR_TP_MULT / ATR_SL_MULT))
 
-                            positions[symbole] = {'quantite_totale': quantite_achetee, 'montant_investi': palier_final, 'prix_moyen': palier_final / quantite_achetee, 'dernier_prix_achat': px_actuel, 'prix_max': px_actuel, 'paliers': 1, 'taille_palier_fixee': palier_final, 'break_even': False, 'marge_trailing': 0.015}
-                            log_trade(f"  >>> 🚀 [{heure_str}] ACHAT {'FLASH ' if flash_entry and signal_trend else ''}| {symbole} ({type_signal})")
+                    if px <= sl_px or time_out or hard_tp:
+                        raison = "TIME" if time_out else ("TP" if hard_tp else "SL/TRAIL")
+                        fill = passer_ordre(sym, "SELL",
+                                            quantite=pos["quantite_totale"],
+                                            ref_price=px)
+                        if fill:
+                            etat["solde_usdt"] += fill["quote_amount"]
+                            pnl = fill["quote_amount"] - pos["montant_investi"]
+                            pnl_pct = pnl / pos["montant_investi"] * 100
+                            del etat["positions"][sym]
+                            log_trade(f"SELL {sym} ({raison}) {pnl_pct:+.2f}% ({pnl:+.2f}$)")
+                            if pnl_pct < 0:
+                                etat["cooldowns"][sym] = now + COOLDOWN_AFTER_LOSS_SEC
+                            sauvegarder_etat(etat)
 
-        sauvegarder_etat(solde_usdt, positions, plus_haut_capital, capital_coffre)
+            # ---------- Radar (60s) ----------
+            if now - derniere_analyse >= 60:
+                derniere_analyse = now
 
-    time.sleep(3)
+                # Equity et coffre
+                prix_pos = obtenir_prix_actuels(list(etat["positions"].keys())) if etat["positions"] else {}
+                val_pos_marche = sum(
+                    p["quantite_totale"] * prix_pos.get(s, p["prix_moyen"])
+                    for s, p in etat["positions"].items()
+                )
+                val_pos_invest = sum(p["montant_investi"] for p in etat["positions"].values())
+                equity = etat["solde_usdt"] + val_pos_marche
+                cap_realise = etat["solde_usdt"] + val_pos_invest
+
+                if cap_realise > etat["plus_haut_capital"]:
+                    gain = cap_realise - etat["plus_haut_capital"]
+                    etat["capital_coffre"] += gain * (1 - TAUX_REINVESTISSEMENT)
+                    etat["plus_haut_capital"] = cap_realise
+
+                cap_travail = max(0.0, cap_realise - etat["capital_coffre"])
+                maj_jour(etat, equity)
+
+                # Nettoyage cooldowns expires
+                etat["cooldowns"] = {s: t for s, t in etat["cooldowns"].items() if t > now}
+
+                pnl_jour = equity - etat["equity_debut_jour"]
+                pnl_jour_pct = (pnl_jour / etat["equity_debut_jour"] * 100
+                                if etat["equity_debut_jour"] > 0 else 0)
+
+                print()
+                mode = "PAPER" if PAPER_TRADING else "LIVE"
+                print(f"[{heure_str}] {mode} | Equity: {equity:.2f}$ ({pnl_jour_pct:+.2f}% jour) | "
+                      f"Libre: {etat['solde_usdt']:.2f}$ | "
+                      f"Coffre: {etat['capital_coffre']:.2f}$ | "
+                      f"Pos: {len(etat['positions'])}/{MAX_POSITIONS}")
+                if etat["trading_bloque_jour"]:
+                    print(f"  -> Trading bloque (limite quotidienne {DAILY_LOSS_LIMIT_PCT}%)")
+
+                if now - derniere_telegram >= 3600:
+                    derniere_telegram = now
+                    envoyer_telegram(
+                        f"Bilan {mode}\n"
+                        f"Equity: {equity:.2f}$ ({pnl_jour_pct:+.2f}% jour)\n"
+                        f"Libre: {etat['solde_usdt']:.2f}$ | Coffre: {etat['capital_coffre']:.2f}$\n"
+                        f"Positions: {len(etat['positions'])}/{MAX_POSITIONS}"
+                    )
+
+                # Scan d'opportunites
+                if not etat["trading_bloque_jour"] and len(etat["positions"]) < MAX_POSITIONS:
+                    candidats = obtenir_top_opportunites()
+                    for sym in candidats:
+                        if sym in etat["positions"]:
+                            continue
+                        if len(etat["positions"]) >= MAX_POSITIONS:
+                            break
+                        if etat["cooldowns"].get(sym, 0) > now:
+                            continue
+
+                        montant = cap_travail * ALLOC_PAR_TRADE
+                        if montant < MIN_ORDER_USDT:
+                            continue
+                        if etat["solde_usdt"] < montant:
+                            continue
+
+                        kl1m = obtenir_klines(sym, "1m", 60)
+                        kl1h = obtenir_klines(sym, "1h", 100)
+                        kl1d = obtenir_klines(sym, "1d", 30)
+                        sig = detecter_signal(kl1m, kl1h, kl1d)
+                        if not sig:
+                            continue
+
+                        a = sig["atr_pct"]
+                        sl_pct = max(SL_FLOOR_PCT, a / 100 * ATR_SL_MULT)
+                        trail_pct = max(SL_FLOOR_PCT, a / 100 * ATR_TRAIL_MULT)
+
+                        fill = passer_ordre(sym, "BUY",
+                                            montant_usdt=montant,
+                                            ref_price=sig["prix"])
+                        if not fill or fill["filled_qty"] <= 0:
+                            continue
+
+                        etat["solde_usdt"] -= fill["quote_amount"]
+                        etat["positions"][sym] = {
+                            "quantite_totale": fill["filled_qty"],
+                            "montant_investi": fill["quote_amount"],
+                            "prix_moyen": fill["avg_price"],
+                            "prix_max": fill["avg_price"],
+                            "ts_entree": now,
+                            "sl_pct": sl_pct,
+                            "trail_pct": trail_pct,
+                            "atr_pct_entree": a,
+                            "break_even": False,
+                        }
+                        log_trade(
+                            f"BUY {sym} | PRU {fill['avg_price']:.6f} | "
+                            f"{fill['quote_amount']:.2f}$ | "
+                            f"SL -{sl_pct*100:.2f}% | trail {trail_pct*100:.2f}% | "
+                            f"ATR {a:.2f}%"
+                        )
+                        time.sleep(0.5)
+
+                sauvegarder_etat(etat)
+
+            time.sleep(3)
+
+        except KeyboardInterrupt:
+            log_info("Arret demande, sauvegarde de l'etat...")
+            sauvegarder_etat(etat)
+            break
+        except Exception as e:
+            log_error(f"Boucle principale: {type(e).__name__}: {e}")
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
