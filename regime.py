@@ -251,11 +251,28 @@ def combiner_regimes(macro, meso, micro, rsi_micro):
         if rs == "TREND_HAUSSIERE":
             # Conviction : tendance alignee sur 4h ET 1h
             if ri == "TREND_HAUSSIERE":
+                # GARDE-FOU surachat : ne pas acheter au sommet d'un pic 15m
+                if rsi_micro is not None and rsi_micro > RSI_OVERBOUGHT:
+                    return ("ATTENTE", "PULLBACK",
+                            f"Tendance OK mais 15m surachete (RSI={rsi_micro:.1f} > {RSI_OVERBOUGHT}) "
+                            f"- attendre repli")
                 return ("TRADE_LONG", "TREND_FOLLOW",
-                        "Tendance haussiere alignee 4h+1h+15m")
-            if ri in ("RANGE", "TRANSITION") and rsi_micro is not None and rsi_micro <= RSI_PULLBACK_MAX:
-                return ("TRADE_LONG", "PULLBACK",
-                        f"Tendance 4h+1h haussiere, pullback 15m (RSI={rsi_micro:.1f})")
+                        f"Tendance haussiere alignee 4h+1h+15m (RSI={rsi_micro:.1f})"
+                        if rsi_micro is not None
+                        else "Tendance haussiere alignee 4h+1h+15m")
+            if ri in ("RANGE", "TRANSITION"):
+                # Pullback confirme : RSI bas dans tendance haussiere
+                if rsi_micro is not None and rsi_micro <= RSI_PULLBACK_MAX:
+                    return ("TRADE_LONG", "PULLBACK",
+                            f"Tendance 4h+1h haussiere, pullback 15m (RSI={rsi_micro:.1f})")
+                # Pullback potentiel : consolidation 15m mais RSI pas encore bas
+                if rsi_micro is not None and rsi_micro <= RSI_OVERBOUGHT:
+                    return ("ATTENTE", "PULLBACK",
+                            f"Tendance haussiere, consolidation 15m (RSI={rsi_micro:.1f}) "
+                            f"- guetter RSI <= {RSI_PULLBACK_MAX} pour entrer")
+                return ("ATTENTE", "NONE",
+                        f"Tendance haussiere mais 15m surachete (RSI={rsi_micro:.1f}) "
+                        f"- attendre repli")
             if ri == "TREND_BAISSIERE":
                 return ("ATTENTE", "PULLBACK",
                         "Tendance 4h+1h haussiere, mais correction 15m en cours - attendre rebond")
@@ -291,6 +308,9 @@ def combiner_regimes(macro, meso, micro, rsi_micro):
         if rs == "TREND_HAUSSIERE":
             return ("ATTENTE", "BREAKOUT",
                     "4h en range mais 1h pousse haussier - debut de breakout potentiel")
+        if rs == "SQUEEZE":
+            return ("ATTENTE", "BREAKOUT",
+                    "4h range + 1h en compression - breakout imminent (direction a confirmer)")
         return ("ATTENTE", "NONE",
                 f"4h range, 1h={rs} - signaux non alignes")
 
