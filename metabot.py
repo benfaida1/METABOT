@@ -104,6 +104,7 @@ TICK_SECONDS            = 3
 INTERVALLE_SIGNAL       = 30
 INTERVALLE_REGIME       = 15 * 60
 INTERVALLE_STATUS       = 60
+INTERVALLE_RAPPORT      = 5 * 60     # rapport des motifs de rejet
 INTERVALLE_TELEGRAM     = 3600
 INTERVALLE_RELIRE_TOP   = 6 * 3600   # relire top_du_jour.json toutes les 6h
 
@@ -381,6 +382,10 @@ _top_cache = {"symbols": [], "ts": 0}
 _regime_cache = {}        # symbol -> dict (regime.analyser_multi_tf)
 _regime_cache_ts = 0
 
+# Stats des evaluations (pour rapport 5 min)
+# symbol -> {"strategie": str, "nb_eval": int, "dernier_motif": str, "ts_dernier": float}
+_eval_stats = {}
+
 
 def lire_top_du_jour():
     """Renvoie la liste des symboles du Top 5 + date du scan."""
@@ -462,8 +467,17 @@ def scan_entry_signals(etat, now):
         if strat == "PULLBACK":
             kl1h = regime.obtenir_klines(sym, "1h", 100)
         sig = strategy.detecter_signal(strat, kl15, kl1h)
+
+        # Tracking pour le rapport 5min
+        st = _eval_stats.setdefault(sym, {"strategie": strat, "nb_eval": 0,
+                                          "dernier_motif": "", "ts_dernier": 0})
+        st["strategie"] = strat
+        st["nb_eval"] += 1
+        st["ts_dernier"] = now
         if not sig:
+            st["dernier_motif"] = strategy.motif_rejet(strat, kl15, kl1h) or "?"
             continue
+        st["dernier_motif"] = "SIGNAL"
 
         atr_p = sig["atr_pct"]
         sl_pct = max(SL_FLOOR_PCT, atr_p / 100 * ATR_SL_MULT)
@@ -589,6 +603,20 @@ def print_status(etat):
         log_info(f"  DRAWDOWN MAX ATTEINT - intervention manuelle")
 
 
+def rapport_rejets():
+    """Affiche un recap des evaluations recentes par paire."""
+    if not _eval_stats:
+        log_info("Rapport scans : aucune paire en TRADE_LONG/RANGE_TRADE evaluee")
+        return
+    items = []
+    for sym, st in sorted(_eval_stats.items()):
+        items.append(f"{sym}({st['strategie']}) x{st['nb_eval']} -> {st['dernier_motif']}")
+    log_info("Rapport scans (5min) : " + " | ".join(items))
+    # Reset des compteurs pour la fenetre suivante
+    for st in _eval_stats.values():
+        st["nb_eval"] = 0
+
+
 def bilan_telegram(etat):
     prix = obtenir_prix_actuels(list(etat["positions"].keys())) if etat["positions"] else {}
     val_pos = sum(p["quantite_totale"] * prix.get(s, p["prix_moyen"])
@@ -633,6 +661,7 @@ def main():
     t_signal   = 0
     t_regime   = time.time()
     t_status   = 0
+    t_rapport  = time.time()
     t_tele     = 0
     t_top      = time.time()
 
@@ -674,6 +703,11 @@ def main():
             if now - t_status >= INTERVALLE_STATUS:
                 t_status = now
                 print_status(etat)
+
+            # Rapport des motifs de rejet (toutes les 5 minutes)
+            if now - t_rapport >= INTERVALLE_RAPPORT:
+                t_rapport = now
+                rapport_rejets()
 
             # Bilan Telegram (toutes les heures)
             if now - t_tele >= INTERVALLE_TELEGRAM:

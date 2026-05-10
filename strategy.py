@@ -341,6 +341,114 @@ def detecter_signal(strategie, klines_15m, klines_1h=None):
 
 
 # =====================================================================
+# motif_rejet : pourquoi une strategie a refuse ce coup-ci ?
+# Reproduit les checks des fonctions signal_*** dans le meme ordre et
+# retourne le label du premier check qui echoue, ou None si tout passe.
+# A garder synchro avec les fonctions de signal en cas d'evolution.
+# =====================================================================
+def motif_rejet(strategie, klines_15m, klines_1h=None):
+    if not klines_15m or len(klines_15m) < 31:
+        return "klines 15m insuffisant"
+    kl15 = klines_15m[:-1]
+    closes_15m = [k["c"] for k in kl15]
+    last = kl15[-1]
+
+    e20   = regime.ema(closes_15m, 20)
+    rsi   = regime.rsi_dernier(closes_15m, 14)
+    atr_p = scanner.atr_pct_journalier(kl15, 14)
+    vol_avg = volume_moyen(kl15, 20)
+
+    if strategie == "TREND_FOLLOW":
+        if not bougie_verte(last):
+            return "bougie rouge"
+        if e20 is None or last["c"] <= e20:
+            return "close<=EMA20"
+        if vol_avg is None or last["v"] < vol_avg * TF_VOLUME_MULT:
+            ratio = last["v"] / vol_avg if vol_avg else 0
+            return f"vol {ratio:.2f}x<{TF_VOLUME_MULT}x"
+        if rsi is None:
+            return "RSI=NA"
+        if rsi < TF_RSI_MIN:
+            return f"RSI {rsi:.1f}<{TF_RSI_MIN}"
+        if rsi > TF_RSI_MAX:
+            return f"RSI {rsi:.1f}>{TF_RSI_MAX}"
+        if atr_p is None or atr_p < ATR_FLOOR_PCT_15M:
+            return f"ATR {atr_p}%<{ATR_FLOOR_PCT_15M}%"
+        return None
+
+    if strategie == "PULLBACK":
+        if not klines_1h or len(klines_1h) < 61:
+            return "klines 1h insuffisant"
+        kl1h = klines_1h[:-1]
+        closes_1h = [k["c"] for k in kl1h]
+        e50_1h = regime.ema(closes_1h, 50)
+        if e50_1h is None or closes_1h[-1] <= e50_1h:
+            return "1h close<=EMA50"
+        rsis = rsi_series(closes_15m, 14)
+        if len(rsis) < PB_LOOKBACK + 1:
+            return "RSI serie trop courte"
+        mini = min(rsis[-PB_LOOKBACK:])
+        if mini > PB_RSI_BAS:
+            return f"creux RSI={mini:.1f}>{PB_RSI_BAS}"
+        if rsis[-1] <= PB_RSI_REBOND:
+            return f"RSI {rsis[-1]:.1f}<={PB_RSI_REBOND} (rebond non confirme)"
+        if rsis[-1] <= rsis[-2]:
+            return f"RSI {rsis[-1]:.1f}<=prev {rsis[-2]:.1f}"
+        if not bougie_verte(last):
+            return "bougie rouge"
+        if atr_p is None or atr_p < ATR_FLOOR_PCT_15M:
+            return f"ATR {atr_p}%<{ATR_FLOOR_PCT_15M}%"
+        return None
+
+    if strategie == "BREAKOUT":
+        if len(kl15) < 100:
+            return "klines<100"
+        bbw_serie = regime.bollinger_width_series(closes_15m, 20, 2)
+        fenetre = [w for w in bbw_serie[-100:] if w is not None]
+        if len(fenetre) < 50:
+            return "BBwidth indispo"
+        tries = sorted(fenetre)
+        seuil_p20 = tries[max(0, len(tries) * 20 // 100 - 1)]
+        recents = bbw_serie[-(BO_SQUEEZE_LOOKBACK + 1):-1]
+        squeeze_recent = any((w is not None and w <= seuil_p20) for w in recents)
+        if not squeeze_recent:
+            return "pas de squeeze recent"
+        highs = [k["h"] for k in kl15]
+        plus_haut_recent = max(highs[-(BO_HIGHS_LOOKBACK + 1):-1])
+        if last["c"] <= plus_haut_recent:
+            return f"close<=high {plus_haut_recent:.6f}"
+        if vol_avg is None or last["v"] < vol_avg * BO_VOLUME_MULT:
+            ratio = last["v"] / vol_avg if vol_avg else 0
+            return f"vol {ratio:.2f}x<{BO_VOLUME_MULT}x"
+        if rsi is None or rsi < BO_RSI_MIN:
+            return f"RSI {rsi}<{BO_RSI_MIN}"
+        if not bougie_verte(last):
+            return "bougie rouge"
+        if atr_p is None or atr_p < ATR_FLOOR_PCT_15M:
+            return f"ATR {atr_p}%<{ATR_FLOOR_PCT_15M}%"
+        return None
+
+    if strategie == "MEAN_REVERSION":
+        adx = scanner.adx_wilder(kl15, 14)
+        if adx is None or adx >= MR_ADX_MAX:
+            return f"ADX {adx}>={MR_ADX_MAX}"
+        if rsi is None or rsi > MR_RSI_MAX:
+            return f"RSI {rsi}>{MR_RSI_MAX}"
+        bb = bollinger_bands(closes_15m, MR_BB_PERIODE, MR_BB_SIGMA)
+        if bb is None:
+            return "BB indispo"
+        if last["c"] > bb[0] * 1.002:
+            return f"close>BB_low"
+        if not bougie_verte(last):
+            return "bougie rouge"
+        if atr_p is None or atr_p < ATR_FLOOR_PCT_15M:
+            return f"ATR {atr_p}%<{ATR_FLOOR_PCT_15M}%"
+        return None
+
+    return "strategie inconnue"
+
+
+# =====================================================================
 # CLI de debug : on demande directement Binance pour un symbole et une strategie
 # =====================================================================
 def _check(label, ok, detail):
