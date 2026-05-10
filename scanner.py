@@ -32,10 +32,18 @@ HTTP_TIMEOUT = 10
 USER_AGENT   = "metabot-scanner/1.0"
 
 # --- Filtres durs : si non respecte, rejet immediat ---
-MIN_VOLUME_24H_USDT  = 50_000_000   # 50 M$ pour eviter la manipulation
+MIN_VOLUME_24H_USDT  = 20_000_000   # 20 M$ : compromis liquidite / nb candidats
 MAX_SPREAD_PCT       = 0.10         # spread bid-ask max (%)
 MIN_AGE_DAYS         = 90           # paire listee depuis au moins 90 jours
 QUOTE_ASSET          = "USDT"
+
+# Filtres anti-piege (sur metriques calculees) :
+# - rejette les coins trop volatils (chaos, news, illiquidite)
+# - rejette les coins en pump tardif (achat au sommet)
+# - rejette les coins sans tendance claire
+MAX_ATR_PCT_DAILY    = 8.0          # rejet si ATR daily > 8%
+MAX_PERF_7J_PCT      = 40.0         # rejet si deja +40% sur 7j (pump terminal)
+MIN_ADX_14D          = 18.0         # rejet si ADX < 18 (pas de tendance)
 
 # Stablecoins / paires "USDT-USDT" a exclure (ne bougent pas)
 STABLE_BASES = {
@@ -517,6 +525,9 @@ def lancer_scan():
     resultats = []
     rejets_age = 0
     rejets_klines = 0
+    rejets_atr_haut = 0
+    rejets_perf_haute = 0
+    rejets_adx_bas = 0
     for i, c in enumerate(candidats):
         if i and i % 25 == 0:
             log(f"  ... {i}/{len(candidats)} analyses")
@@ -536,6 +547,20 @@ def lancer_scan():
         # ADX et ATR doivent etre calculables ; sinon on skip
         if m["atr_pct_daily"] is None or m["adx_14d"] is None:
             rejets_klines += 1
+            continue
+
+        # Filtres anti-piege calibres
+        if m["atr_pct_daily"] > MAX_ATR_PCT_DAILY:
+            log_v(f"  REJET ATR haut {c['symbol']}: {m['atr_pct_daily']:.2f}%")
+            rejets_atr_haut += 1
+            continue
+        if m["perf_7j_pct"] > MAX_PERF_7J_PCT:
+            log_v(f"  REJET perf 7j {c['symbol']}: +{m['perf_7j_pct']:.1f}%")
+            rejets_perf_haute += 1
+            continue
+        if m["adx_14d"] < MIN_ADX_14D:
+            log_v(f"  REJET ADX bas {c['symbol']}: {m['adx_14d']:.1f}")
+            rejets_adx_bas += 1
             continue
 
         score_total, sous = calculer_score(m, c["spread_pct"], btc_perf_7j)
@@ -562,7 +587,9 @@ def lancer_scan():
         })
 
     log(f"Analyses completes : {len(resultats)} | "
-        f"rejets age : {rejets_age} | rejets klines : {rejets_klines}")
+        f"rejets age : {rejets_age} | klines : {rejets_klines} | "
+        f"ATR haut : {rejets_atr_haut} | perf 7j : {rejets_perf_haute} | "
+        f"ADX bas : {rejets_adx_bas}")
 
     if not resultats:
         log("Aucun resultat scorable.")
@@ -584,12 +611,19 @@ def lancer_scan():
             "min_volume_24h_usdt": MIN_VOLUME_24H_USDT,
             "max_spread_pct": MAX_SPREAD_PCT,
             "min_age_jours": MIN_AGE_DAYS,
+            "max_atr_pct_daily": MAX_ATR_PCT_DAILY,
+            "max_perf_7j_pct": MAX_PERF_7J_PCT,
+            "min_adx_14d": MIN_ADX_14D,
             "poids_score": POIDS,
         },
         "stats": {
             "univers_eligible": len(eligibles),
             "passe_filtre_volume": len(candidats),
             "passe_filtre_spread": len(candidats),
+            "rejets_age": rejets_age,
+            "rejets_atr_haut": rejets_atr_haut,
+            "rejets_perf_haute": rejets_perf_haute,
+            "rejets_adx_bas": rejets_adx_bas,
             "scores_calcules": len(resultats),
             "btc_perf_7j_pct": round(btc_perf_7j, 2) if btc_perf_7j is not None else None,
         },
