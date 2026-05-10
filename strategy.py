@@ -33,7 +33,7 @@ import regime    # ema, ema_series, bollinger_width_series, rsi_dernier
 ATR_FLOOR_PCT_15M = 0.30          # ATR 15m mini pour qu'un trade vaille la peine
 
 # TREND_FOLLOW
-TF_VOLUME_MULT       = 1.2        # vol bougie courante >= 1.2x moy 20
+TF_VOLUME_MULT       = 1.0        # vol bougie fermee >= moyenne (pas affaibli)
 TF_RSI_MIN           = 50.0
 TF_RSI_MAX           = 70.0
 
@@ -44,7 +44,7 @@ PB_RSI_REBOND        = 45.0       # RSI courant doit avoir rebondi au-dessus
 
 # BREAKOUT
 BO_SQUEEZE_LOOKBACK  = 10         # squeeze present dans les N dernieres bougies
-BO_VOLUME_MULT       = 1.5        # vol cassure >= 1.5x moy 20
+BO_VOLUME_MULT       = 1.3        # vol cassure >= 1.3x moy 20 (renforce sans extreme)
 BO_RSI_MIN           = 55.0
 BO_HIGHS_LOOKBACK    = 20         # cassure du plus haut des N dernieres bougies
 
@@ -108,9 +108,11 @@ def bougie_verte(kline):
 # Strategie 1 : TREND_FOLLOW
 # =====================================================================
 def signal_trend_follow(klines_15m):
-    """Cassure / continuation dans tendance haussiere alignee."""
-    if not klines_15m or len(klines_15m) < 30:
+    """Cassure / continuation dans tendance haussiere alignee.
+       Analyse la derniere bougie FERMEE (klines[-1] = bougie en cours, ignoree)."""
+    if not klines_15m or len(klines_15m) < 31:
         return None
+    klines_15m = klines_15m[:-1]    # exclut la bougie en cours
     closes = [k["c"] for k in klines_15m]
     last = klines_15m[-1]
 
@@ -152,11 +154,14 @@ def signal_trend_follow(klines_15m):
 # Strategie 2 : PULLBACK
 # =====================================================================
 def signal_pullback(klines_15m, klines_1h):
-    """Achat du creux dans tendance haussiere : RSI bas qui rebondit."""
-    if not klines_15m or len(klines_15m) < 30:
+    """Achat du creux dans tendance haussiere : RSI bas qui rebondit.
+       Analyse les dernieres bougies FERMEES sur les deux TFs."""
+    if not klines_15m or len(klines_15m) < 31:
         return None
-    if not klines_1h or len(klines_1h) < 60:
+    if not klines_1h or len(klines_1h) < 61:
         return None
+    klines_15m = klines_15m[:-1]
+    klines_1h  = klines_1h[:-1]
     closes_15m = [k["c"] for k in klines_15m]
     closes_1h  = [k["c"] for k in klines_1h]
     last = klines_15m[-1]
@@ -204,9 +209,11 @@ def signal_pullback(klines_15m, klines_1h):
 # Strategie 3 : BREAKOUT
 # =====================================================================
 def signal_breakout(klines_15m):
-    """Entree sur sortie de compression Bollinger avec volume + cassure."""
-    if not klines_15m or len(klines_15m) < 100:
+    """Entree sur sortie de compression Bollinger avec volume + cassure.
+       Analyse la derniere bougie FERMEE."""
+    if not klines_15m or len(klines_15m) < 101:
         return None
+    klines_15m = klines_15m[:-1]
     closes = [k["c"] for k in klines_15m]
     highs  = [k["h"] for k in klines_15m]
     last = klines_15m[-1]
@@ -264,9 +271,11 @@ def signal_breakout(klines_15m):
 # Strategie 4 : MEAN_REVERSION
 # =====================================================================
 def signal_mean_reversion(klines_15m):
-    """Achat zone basse Bollinger en range, RSI tres bas qui amorce un rebond."""
-    if not klines_15m or len(klines_15m) < 60:
+    """Achat zone basse Bollinger en range, RSI tres bas qui amorce un rebond.
+       Analyse la derniere bougie FERMEE."""
+    if not klines_15m or len(klines_15m) < 61:
         return None
+    klines_15m = klines_15m[:-1]
     closes = [k["c"] for k in klines_15m]
     last = klines_15m[-1]
 
@@ -341,14 +350,19 @@ def _check(label, ok, detail):
 
 
 def diagnose(strategie, klines_15m, klines_1h=None):
-    """Affiche chaque check etape par etape. Utile en debug."""
-    if not klines_15m or len(klines_15m) < 30:
+    """Affiche chaque check etape par etape (sur la bougie FERMEE)."""
+    if not klines_15m or len(klines_15m) < 31:
         print("  [FAIL] klines 15m insuffisant")
         return
 
+    # Aligne sur la bougie fermee comme les fonctions de signal
+    klines_15m = klines_15m[:-1]
+    if klines_1h is not None and len(klines_1h) >= 2:
+        klines_1h = klines_1h[:-1]
+
     closes_15m = [k["c"] for k in klines_15m]
     last = klines_15m[-1]
-    print(f"  Bougie courante : open={last['o']:.6f}  close={last['c']:.6f}  "
+    print(f"  Bougie FERMEE : open={last['o']:.6f}  close={last['c']:.6f}  "
           f"vol={last['v']:.0f}")
 
     # Indicateurs communs
