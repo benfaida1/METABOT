@@ -334,14 +334,116 @@ def detecter_signal(strategie, klines_15m, klines_1h=None):
 # =====================================================================
 # CLI de debug : on demande directement Binance pour un symbole et une strategie
 # =====================================================================
+def _check(label, ok, detail):
+    mark = "OK  " if ok else "FAIL"
+    print(f"  [{mark}] {label:<32} {detail}")
+    return ok
+
+
+def diagnose(strategie, klines_15m, klines_1h=None):
+    """Affiche chaque check etape par etape. Utile en debug."""
+    if not klines_15m or len(klines_15m) < 30:
+        print("  [FAIL] klines 15m insuffisant")
+        return
+
+    closes_15m = [k["c"] for k in klines_15m]
+    last = klines_15m[-1]
+    print(f"  Bougie courante : open={last['o']:.6f}  close={last['c']:.6f}  "
+          f"vol={last['v']:.0f}")
+
+    # Indicateurs communs
+    e20 = regime.ema(closes_15m, 20)
+    rsi = regime.rsi_dernier(closes_15m, 14)
+    atr_p = scanner.atr_pct_journalier(klines_15m, 14)
+    vol_avg = volume_moyen(klines_15m, 20)
+    print(f"  EMA20(15m)={e20:.6f}  RSI(15m)={rsi:.1f}  ATR={atr_p:.2f}%  "
+          f"vol_moy20={vol_avg:.0f}")
+
+    if strategie == "TREND_FOLLOW":
+        _check("bougie verte",          bougie_verte(last),
+               f"close>open ? {last['c']:.6f} > {last['o']:.6f}")
+        _check("close > EMA20",         last["c"] > e20,
+               f"{last['c']:.6f} > {e20:.6f}")
+        _check(f"volume >= {TF_VOLUME_MULT}x moy", last["v"] >= vol_avg * TF_VOLUME_MULT,
+               f"ratio = {last['v']/vol_avg:.2f}x")
+        _check(f"RSI in [{TF_RSI_MIN};{TF_RSI_MAX}]", TF_RSI_MIN <= rsi <= TF_RSI_MAX,
+               f"RSI = {rsi:.1f}")
+        _check(f"ATR >= {ATR_FLOOR_PCT_15M}%", atr_p >= ATR_FLOOR_PCT_15M,
+               f"ATR = {atr_p:.2f}%")
+
+    elif strategie == "PULLBACK":
+        if not klines_1h or len(klines_1h) < 60:
+            print("  [FAIL] klines 1h insuffisant")
+            return
+        closes_1h = [k["c"] for k in klines_1h]
+        e50_1h = regime.ema(closes_1h, 50)
+        _check("prix > EMA50(1h)",      closes_1h[-1] > e50_1h,
+               f"{closes_1h[-1]:.6f} > {e50_1h:.6f}")
+        rsis = rsi_series(closes_15m, 14)
+        if len(rsis) >= PB_LOOKBACK + 1:
+            mini = min(rsis[-PB_LOOKBACK:])
+            _check(f"RSI 15m touche <= {PB_RSI_BAS} (en {PB_LOOKBACK} bougies)",
+                   mini <= PB_RSI_BAS, f"min={mini:.1f}")
+            _check(f"RSI 15m courant > {PB_RSI_REBOND}", rsis[-1] > PB_RSI_REBOND,
+                   f"RSI = {rsis[-1]:.1f}")
+            _check("RSI en hausse stricte",  rsis[-1] > rsis[-2],
+                   f"{rsis[-1]:.1f} > {rsis[-2]:.1f}")
+        _check("bougie verte", bougie_verte(last),
+               f"close>open ? {last['c']:.6f} > {last['o']:.6f}")
+        _check(f"ATR >= {ATR_FLOOR_PCT_15M}%", atr_p >= ATR_FLOOR_PCT_15M,
+               f"ATR = {atr_p:.2f}%")
+
+    elif strategie == "BREAKOUT":
+        bbw_serie = regime.bollinger_width_series(closes_15m, 20, 2)
+        fenetre = [w for w in bbw_serie[-100:] if w is not None]
+        if len(fenetre) >= 50:
+            tries = sorted(fenetre)
+            seuil_p20 = tries[max(0, len(tries) * 20 // 100 - 1)]
+            recents = bbw_serie[-(BO_SQUEEZE_LOOKBACK + 1):-1]
+            squeeze_recent = any((w is not None and w <= seuil_p20) for w in recents)
+            bbw_min_recent = min((w for w in recents if w is not None), default=None)
+            _check(f"squeeze present (BBwidth <= P20)", squeeze_recent,
+                   f"min recent={bbw_min_recent}  seuil P20={seuil_p20:.5f}")
+        highs = [k["h"] for k in klines_15m]
+        plus_haut = max(highs[-(BO_HIGHS_LOOKBACK + 1):-1])
+        _check(f"close > max high {BO_HIGHS_LOOKBACK} bougies", last["c"] > plus_haut,
+               f"{last['c']:.6f} > {plus_haut:.6f}")
+        _check(f"volume >= {BO_VOLUME_MULT}x moy",
+               last["v"] >= vol_avg * BO_VOLUME_MULT,
+               f"ratio = {last['v']/vol_avg:.2f}x")
+        _check(f"RSI > {BO_RSI_MIN}", rsi > BO_RSI_MIN, f"RSI = {rsi:.1f}")
+        _check("bougie verte", bougie_verte(last),
+               f"close>open ? {last['c']:.6f} > {last['o']:.6f}")
+        _check(f"ATR >= {ATR_FLOOR_PCT_15M}%", atr_p >= ATR_FLOOR_PCT_15M,
+               f"ATR = {atr_p:.2f}%")
+
+    elif strategie == "MEAN_REVERSION":
+        adx = scanner.adx_wilder(klines_15m, 14)
+        bb = bollinger_bands(closes_15m, MR_BB_PERIODE, MR_BB_SIGMA)
+        bb_low, bb_mid, bb_up = bb if bb else (None, None, None)
+        _check(f"ADX < {MR_ADX_MAX} (range)", adx is not None and adx < MR_ADX_MAX,
+               f"ADX = {adx:.1f}" if adx is not None else "ADX=NA")
+        _check(f"RSI <= {MR_RSI_MAX} (survendu)", rsi <= MR_RSI_MAX,
+               f"RSI = {rsi:.1f}")
+        if bb_low is not None:
+            _check("close <= BB_lower (tol 0.2%)", last["c"] <= bb_low * 1.002,
+                   f"close={last['c']:.6f}  BB_low={bb_low:.6f}")
+        _check("bougie verte", bougie_verte(last),
+               f"close>open ? {last['c']:.6f} > {last['o']:.6f}")
+        _check(f"ATR >= {ATR_FLOOR_PCT_15M}%", atr_p >= ATR_FLOOR_PCT_15M,
+               f"ATR = {atr_p:.2f}%")
+
+
 def main():
     import sys
-    if len(sys.argv) < 3:
-        print("Usage : python3 strategy.py SYMBOLE STRATEGIE")
+    verbose = "--verbose" in sys.argv or "-v" in sys.argv
+    args = [a for a in sys.argv[1:] if a not in ("--verbose", "-v")]
+    if len(args) < 2:
+        print("Usage : python3 strategy.py SYMBOLE STRATEGIE [--verbose]")
         print("Strategies : " + ", ".join(DISPATCHER.keys()))
         sys.exit(1)
-    symbole = sys.argv[1].upper()
-    strategie = sys.argv[2].upper()
+    symbole = args[0].upper()
+    strategie = args[1].upper()
     if strategie not in DISPATCHER:
         print(f"Strategie inconnue : {strategie}")
         sys.exit(1)
@@ -356,6 +458,10 @@ def main():
     sig = detecter_signal(strategie, kl15, kl1h)
     if sig is None:
         print("Pas de signal.")
+        if verbose:
+            print()
+            print("Diagnostic detaille :")
+            diagnose(strategie, kl15, kl1h)
     else:
         print(f"SIGNAL {sig['strategie']} sur {symbole} :")
         print(f"  prix entree : {sig['prix']}")
