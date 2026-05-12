@@ -3,3 +3,6 @@ historique_trades.txt
 __pycache__/
 *.pyc
 .env
+bot_pause.flag
+telegram_bot.log
+erreurs.log

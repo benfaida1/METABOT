@@ -113,6 +113,7 @@ FICHIER_TOP        = "top_du_jour.json"
 FICHIER_ETAT       = "etat_bot.json"
 FICHIER_TRADES     = "historique_trades.txt"
 FICHIER_ERREURS    = "erreurs.log"
+FICHIER_PAUSE      = "bot_pause.flag"  # cree/supprime via telegram_bot.py (/pause /resume)
 
 
 # =====================================================================
@@ -435,6 +436,8 @@ def refresh_regime_cache():
 def scan_entry_signals(etat, now):
     """Pour chaque paire du Top avec une decision tradable, evalue un signal."""
     if etat["drawdown_atteint"] or etat["trading_bloque_jour"]:
+        return
+    if os.path.exists(FICHIER_PAUSE):
         return
     if len(etat["positions"]) >= MAX_POSITIONS:
         return
