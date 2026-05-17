@@ -188,8 +188,15 @@ WINDOW_15M = 200
 WINDOW_1H  = 80
 
 
-def backtest_strategie(symbole, strategie_name, klines_15m, klines_1h):
-    """Boucle bougie par bougie, applique detecter_signal sur des slices."""
+def backtest_strategie(symbole, strategie_name, klines_15m, klines_1h,
+                       window_15m=WINDOW_15M, window_1h=WINDOW_1H):
+    """Boucle bougie par bougie, applique detecter_signal sur des slices.
+
+    window_15m / window_1h : taille de la fenetre passee aux fonctions de
+    signal. 200 / 80 est largement suffisant (BREAKOUT regarde 101 bars,
+    PULLBACK 61 bars 1h). Augmenter ne change PAS les resultats — c'est
+    juste un test de robustesse.
+    """
     trades = []
     fn = strategy.DISPATCHER.get(strategie_name)
     if fn is None:
@@ -200,7 +207,7 @@ def backtest_strategie(symbole, strategie_name, klines_15m, klines_1h):
     i = i_start
     while i < len(klines_15m) - 2:
         # Fenetre glissante (suffit aux indicateurs, evite l'explosion RAM)
-        slice_15m = klines_15m[max(0, i - WINDOW_15M + 1) : i + 1]
+        slice_15m = klines_15m[max(0, i - window_15m + 1) : i + 1]
 
         if strategie_name == "PULLBACK":
             t_15m = slice_15m[-1]["t"]
@@ -208,7 +215,7 @@ def backtest_strategie(symbole, strategie_name, klines_15m, klines_1h):
             if j < 60:
                 i += 1
                 continue
-            slice_1h = klines_1h[max(0, j - WINDOW_1H + 1) : j + 1]
+            slice_1h = klines_1h[max(0, j - window_1h + 1) : j + 1]
             sig = strategy.detecter_signal(strategie_name, slice_15m, slice_1h)
         else:
             sig = strategy.detecter_signal(strategie_name, slice_15m)
@@ -217,7 +224,6 @@ def backtest_strategie(symbole, strategie_name, klines_15m, klines_1h):
             i += 1
             continue
 
-        nb_signaux += 1
         entry_close = sig["prix"]
         entry_fill = entry_close * (1 + SLIPPAGE_RATE)   # fill cote acheteur
         atr_p = sig["atr_pct"]
@@ -403,6 +409,13 @@ def main():
                     help="Strategie unique a tester (defaut: toutes)")
     ap.add_argument("--json", default=None,
                     help="Si fourni, exporte tous les trades dans ce fichier JSON")
+    ap.add_argument("--window-15m", type=int, default=WINDOW_15M,
+                    help=f"Taille de fenetre 15m passee aux strategies "
+                         f"(defaut {WINDOW_15M}). Augmenter ne change PAS les "
+                         f"resultats, c'est juste plus lent et plus gourmand "
+                         f"en RAM. Mettre 99999 pour passer tout l'historique.")
+    ap.add_argument("--window-1h", type=int, default=WINDOW_1H,
+                    help=f"Taille de fenetre 1h pour PULLBACK (defaut {WINDOW_1H}).")
     args = ap.parse_args()
 
     strategies = [args.strategie.upper()] if args.strategie else STRATEGIES_DEFAUT
@@ -438,7 +451,9 @@ def main():
     trades_par_strat = {s: [] for s in strategies}
     for strat in strategies:
         for sym, k in klines_par_sym.items():
-            ts = backtest_strategie(sym, strat, k["15m"], k["1h"])
+            ts = backtest_strategie(sym, strat, k["15m"], k["1h"],
+                                    window_15m=args.window_15m,
+                                    window_1h=args.window_1h)
             trades_par_strat[strat].extend(ts)
             print(f"  {strat:<16} {sym:<10} -> {len(ts)} trades")
 
