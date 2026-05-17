@@ -181,6 +181,13 @@ def simuler_sortie(entry_price, sl_pct, trail_pct, klines_apres):
 # =====================================================================
 # Backtest d'une strategie sur un symbole
 # =====================================================================
+# Fenetres glissantes passees a detecter_signal : suffisent aux indicateurs
+# (BREAKOUT a besoin de 101 bougies max, PULLBACK 61 en 1h) et evitent le
+# slicing O(n^2) qui explose la RAM sur les longs historiques.
+WINDOW_15M = 200
+WINDOW_1H  = 80
+
+
 def backtest_strategie(symbole, strategie_name, klines_15m, klines_1h):
     """Boucle bougie par bougie, applique detecter_signal sur des slices."""
     trades = []
@@ -188,16 +195,12 @@ def backtest_strategie(symbole, strategie_name, klines_15m, klines_1h):
     if fn is None:
         return trades
 
-    # On a besoin d'assez d'historique pour les indicateurs.
-    # detecter_signal exclut la bougie en cours via [:-1], donc on passe
-    # klines_15m[:i+1] et la fonction analysera la bougie i.
-    # Min requis : 100 bougies pour BREAKOUT, 60 pour MR, 31 pour TF, et
-    # 61 bougies 1h pour PULLBACK. On commence a i=120 pour etre safe.
+    # On commence apres avoir assez d'historique pour les indicateurs.
     i_start = 120
     i = i_start
-    nb_signaux = 0
     while i < len(klines_15m) - 2:
-        slice_15m = klines_15m[:i + 1]
+        # Fenetre glissante (suffit aux indicateurs, evite l'explosion RAM)
+        slice_15m = klines_15m[max(0, i - WINDOW_15M + 1) : i + 1]
 
         if strategie_name == "PULLBACK":
             t_15m = slice_15m[-1]["t"]
@@ -205,7 +208,7 @@ def backtest_strategie(symbole, strategie_name, klines_15m, klines_1h):
             if j < 60:
                 i += 1
                 continue
-            slice_1h = klines_1h[:j + 1]
+            slice_1h = klines_1h[max(0, j - WINDOW_1H + 1) : j + 1]
             sig = strategy.detecter_signal(strategie_name, slice_15m, slice_1h)
         else:
             sig = strategy.detecter_signal(strategie_name, slice_15m)
