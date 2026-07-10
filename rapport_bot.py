@@ -199,31 +199,65 @@ def generer_rapport(state, executions, premiere, derniere):
     w("")
 
     # -----------------------------------------------------------------
-    # 4. DERNIERS SIGNAUX OBSERVES
+    # 4. STATISTIQUES DES SIGNAUX SUR TOUTE LA PERIODE
     # -----------------------------------------------------------------
     w("=" * 70)
-    w("  4. DERNIERS SIGNAUX OBSERVES (5 dernieres executions)")
+    w("  4. STATISTIQUES DES SIGNAUX (toute la periode)")
     w("=" * 70)
     if not executions:
         w("  (aucune execution parsee dans le log)")
     else:
-        for ex in executions[-5:]:
-            w(f"  {ex['date']} :")
+        # Comptage des signaux par coin sur tout l'historique
+        stats = {sym: {"BUY": 0, "SELL": 0, "HOLD": 0} for sym in SYMBOLES}
+        jours_haussiers = {sym: 0 for sym in SYMBOLES}
+        for ex in executions:
             for sym in SYMBOLES:
                 s = ex["signaux"].get(sym)
-                if s:
-                    tendance = "haussiere" if s["ma50"] > s["ma200"] else "baissiere"
-                    w(f"    {sym:8} {s['signal']:5} close={s['close']:>10.2f} "
-                      f"(MA50 {'>' if s['ma50'] > s['ma200'] else '<'} MA200 -> {tendance})")
-            if ex["actions"]:
-                w(f"    >> ACTIONS : {', '.join(ex['actions'])}")
-            w("")
+                if not s:
+                    continue
+                stats[sym][s["signal"]] = stats[sym].get(s["signal"], 0) + 1
+                if s["ma50"] > s["ma200"]:
+                    jours_haussiers[sym] += 1
+        w(f"{'SYMBOLE':<9} {'#BUY':>6} {'#SELL':>6} {'#HOLD':>6} "
+          f"{'J.HAUSSIERS':>12}")
+        w("-" * 70)
+        for sym in SYMBOLES:
+            st = stats[sym]
+            w(f"{sym:<9} {st['BUY']:>6} {st['SELL']:>6} {st['HOLD']:>6} "
+              f"{jours_haussiers[sym]:>12}")
+        w("")
+        w("  ('J.HAUSSIERS' = nb de jours ou MA50 > MA200, donc tendance")
+        w("   de fond haussiere : condition necessaire pour un BUY.)")
+    w("")
 
     # -----------------------------------------------------------------
-    # 5. RESUME / LECTURE
+    # 5. HISTORIQUE COMPLET JOUR PAR JOUR
     # -----------------------------------------------------------------
     w("=" * 70)
-    w("  5. LECTURE DU RAPPORT")
+    w("  5. HISTORIQUE COMPLET (chaque jour depuis le debut)")
+    w("=" * 70)
+    if not executions:
+        w("  (aucune execution parsee dans le log)")
+    else:
+        w(f"{'DATE':<12} {'BTC':>6} {'ETH':>6} {'SOL':>6} {'BNB':>6}  ACTIONS")
+        w("-" * 70)
+        for ex in executions:
+            cols = []
+            for sym in SYMBOLES:
+                s = ex["signaux"].get(sym)
+                cols.append(s["signal"] if s else "-")
+            actions = ", ".join(ex["actions"]) if ex["actions"] else ""
+            w(f"{ex['date']:<12} {cols[0]:>6} {cols[1]:>6} {cols[2]:>6} "
+              f"{cols[3]:>6}  {actions}")
+        w("-" * 70)
+        w(f"  Total : {len(executions)} jours d'execution enregistres.")
+    w("")
+
+    # -----------------------------------------------------------------
+    # 6. RESUME / LECTURE
+    # -----------------------------------------------------------------
+    w("=" * 70)
+    w("  6. LECTURE DU RAPPORT")
     w("=" * 70)
     nb_pos = len(state.get("positions", {})) if state else 0
     nb_trades = len(trades)
