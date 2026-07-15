@@ -11,18 +11,83 @@ Lit deux sources :
 Produit un rapport texte affiche a l'ecran ET ecrit dans rapport_bot.txt.
 
 Usage :
-    python3 rapport_bot.py
+    python3 rapport_bot.py                      # affiche + ecrit rapport_bot.txt
+    python3 rapport_bot.py --telegram           # + envoie sur Telegram
+    python3 rapport_bot.py --telegram --quiet   # pour le cron (pas d'affichage)
     python3 rapport_bot.py --state trend_d1_state.json --log trend_d1.log
     python3 rapport_bot.py --out mon_rapport.txt
+
+Envoi Telegram : necessite les variables d'environnement TELEGRAM_TOKEN et
+TELEGRAM_CHAT_ID (deja definies dans le crontab du VPS).
 """
 import argparse
 import json
 import os
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 
 SYMBOLES = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+
+
+# =====================================================================
+# Envoi Telegram (rapport complet, decoupe en morceaux < 4096 car)
+# =====================================================================
+def escaper_html(s):
+    """Echappe les caracteres speciaux HTML pour Telegram parse_mode=HTML."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def envoyer_telegram(rapport):
+    """Envoie le rapport sur Telegram, decoupe en messages < 4096 caracteres.
+
+    Chaque morceau est envoye dans un bloc <pre> pour garder l'alignement
+    en police a chasse fixe. Renvoie True si tout est parti sans erreur.
+    """
+    token = os.environ.get("TELEGRAM_TOKEN", "")
+    chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat:
+        print("  ! TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID manquant. Envoi annule.")
+        return False
+
+    # Decoupe le rapport en morceaux de lignes sous ~3500 caracteres
+    # (marge sous la limite Telegram de 4096, balises <pre> incluses).
+    lignes = rapport.split("\n")
+    morceaux = []
+    courant = ""
+    for ligne in lignes:
+        if len(courant) + len(ligne) + 1 > 3500:
+            morceaux.append(courant)
+            courant = ""
+        courant += ligne + "\n"
+    if courant.strip():
+        morceaux.append(courant)
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    total = len(morceaux)
+    ok = True
+    for i, morceau in enumerate(morceaux, 1):
+        entete = f"[Rapport {i}/{total}]\n" if total > 1 else ""
+        texte = entete + "<pre>" + escaper_html(morceau) + "</pre>"
+        data = urllib.parse.urlencode({
+            "chat_id": chat,
+            "text": texte,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }).encode("utf-8")
+        try:
+            req = urllib.request.Request(url, data=data)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                r.read()
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            print(f"  ! erreur Telegram (morceau {i}/{total}) : {e}")
+            ok = False
+    if ok:
+        print(f"  [OK] Rapport envoye sur Telegram ({total} message(s)).")
+    return ok
 
 
 # =====================================================================
@@ -289,6 +354,10 @@ def main():
     ap.add_argument("--state", default="trend_d1_state.json")
     ap.add_argument("--log", default="trend_d1.log")
     ap.add_argument("--out", default="rapport_bot.txt")
+    ap.add_argument("--telegram", action="store_true",
+                    help="Envoie aussi le rapport complet sur Telegram.")
+    ap.add_argument("--quiet", action="store_true",
+                    help="N'affiche pas le rapport a l'ecran (utile en cron).")
     args = ap.parse_args()
 
     state = charger_state(args.state)
@@ -296,11 +365,16 @@ def main():
 
     rapport = generer_rapport(state, executions, premiere, derniere)
 
-    print(rapport)
+    if not args.quiet:
+        print(rapport)
 
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(rapport + "\n")
-    print(f"\n[OK] Rapport ecrit dans : {args.out}")
+    if not args.quiet:
+        print(f"\n[OK] Rapport ecrit dans : {args.out}")
+
+    if args.telegram:
+        envoyer_telegram(rapport)
 
 
 if __name__ == "__main__":
